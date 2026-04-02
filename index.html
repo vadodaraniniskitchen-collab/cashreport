@@ -507,210 +507,197 @@ function printEnvelopeBreakdown() {
 
 
 // ══════════════════════════════════════════════════════════════
-// SCAN & AUTO-FILL FEATURE  (non-invasive — reads existing IDs)
+// SCAN & AUTO-FILL  —  v3  (Claude Vision primary, Tesseract fallback)
 // ══════════════════════════════════════════════════════════════
 
-/**
- * Keyword map: field-id → array of keywords to search (case-insensitive)
- * Multiple keywords per field → ANY match triggers extraction
- */
-const SCAN_KEYWORD_MAP = {
-  'rep-UPI':      ['paytm - offline', 'paytm offline', 'paytm-offline', 'paytm'],
-  'rep-Card':     ['credit card', 'creditcard'],
-  'rep-Dineout':  ['dine out', 'dineout'],
-  'rep-Zomato':   ['zomato pay'],
-  'rep-Razorpay': ['razorpay'],
-  'rep-Cash':     ['cash']
+// ── 1. FIELD CONFIG ───────────────────────────────────────────
+// Each entry: { keywords[], strategy }
+//   strategy "cash"   → line whose first token === keyword[0]; last decimal
+//   strategy "last"   → first line containing any keyword (not "online"); last decimal
+//   strategy "window" → old approach; kept for safety
+const FIELD_CONFIG = {
+  'rep-Cash':     { keywords: ['cash'],                                        strategy: 'cash'   },
+  'rep-Zomato':   { keywords: ['zomato'],          excludes: ['online'],       strategy: 'last'   },
+  'rep-UPI':      { keywords: ['paytm - offline','paytm offline','paytm-offline','paytm','upi'], strategy: 'last'   },
+  'rep-Card':     { keywords: ['credit card','creditcard','card'],             strategy: 'last'   },
+  'rep-Dineout':  { keywords: ['dine out','dineout'],                          strategy: 'last'   },
+  'rep-Razorpay': { keywords: ['razorpay'],                                    strategy: 'last'   },
 };
 
-/**
- * ─────────────────────────────────────────────────────────────
- * LINE-BASED OCR PARSER  (replaces old window-based extractor)
- * ─────────────────────────────────────────────────────────────
- *
- * Rules:
- *  1. Split OCR text into individual lines and work line-by-line.
- *  2. Cash  → line whose FIRST word is "cash" (case-insensitive).
- *             Last decimal number (d+.d+) on that line = Cash Amount.
- *  3. Zomato → line containing "zomato" (case-insensitive),
- *              but NOT also containing "online".
- *              Last decimal number on that line = Zomato Amount.
- *  4. Every line is lowercased + trimmed before matching.
- *  5. OCR noise (extra chars, merged words like zZomato) is handled
- *     by checking includes() after normalisation.
- *  6. Integers without decimals are ignored (OCR noise).
- *  7. The LAST decimal number is used (Amount column, not Bills).
- */
-
-/** Normalise a single OCR line */
-function normaliseLine(line) {
-  return line
+// ── 2. HELPERS ────────────────────────────────────────────────
+function ocr_normLine(raw) {
+  return raw
     .toLowerCase()
-    .replace(/[^\x20-\x7E]/g, ' ')   // strip non-ASCII (₹, etc.)
+    .replace(/[^\x20-\x7E]/g, ' ')  // strip ₹ and other non-ASCII
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-/** Extract all decimal numbers (d+.d+) from a string; returns array */
-function extractDecimals(str) {
-  const matches = str.match(/\d+\.\d+/g) || [];
-  return matches.map(Number);
+/** All decimal numbers (d+.d+) in a string, as floats */
+function ocr_decimals(str) {
+  return (str.match(/\d[\d,]*\.\d+/g) || [])
+    .map(s => parseFloat(s.replace(/,/g, '')))
+    .filter(n => !isNaN(n));
+}
+
+/** All integers (no decimal) in a string, as ints — used as fallback */
+function ocr_integers(str) {
+  return (str.match(/\b\d{3,}\b/g) || [])   // 3+ digit integers only
+    .map(Number)
+    .filter(n => n > 0);
 }
 
 /**
- * parseCashAndZomato(ocrText)
- * Returns { cash: number|null, zomato: number|null }
+ * Best amount from a line:
+ *  1. Last decimal number  (most reliable — Amount column is rightmost)
+ *  2. Fallback: largest integer ≥ 100 (OCR dropped the ".00")
  */
-function parseCashAndZomato(ocrText) {
+function ocr_bestAmount(line) {
+  const decs = ocr_decimals(line);
+  if (decs.length > 0) return decs[decs.length - 1];
+  const ints = ocr_integers(line);
+  if (ints.length > 0) return Math.max(...ints);
+  return null;
+}
+
+// ── 3. CORE LINE-BASED PARSER ─────────────────────────────────
+/**
+ * parseAllFields(ocrText)
+ * Applies FIELD_CONFIG rules to raw OCR text.
+ * Returns { 'rep-Cash': 10988, 'rep-Zomato': 2184, … } (null if not found)
+ */
+function parseAllFields(ocrText) {
+  const results = {};
+  Object.keys(FIELD_CONFIG).forEach(k => results[k] = null);
+
   const lines = ocrText.split('\n');
-  let cash   = null;
-  let zomato = null;
 
   for (const raw of lines) {
-    const line = normaliseLine(raw);
+    const line = ocr_normLine(raw);
     if (!line) continue;
 
-    // ── Cash: first word must be exactly "cash" ──────────────────
-    if (cash === null) {
-      const firstWord = line.split(/\s+/)[0];
-      if (firstWord === 'cash') {
-        const decimals = extractDecimals(line);
-        if (decimals.length > 0) {
-          cash = decimals[decimals.length - 1];   // last decimal = Amount
+    for (const [fieldId, cfg] of Object.entries(FIELD_CONFIG)) {
+      if (results[fieldId] !== null) continue;  // already found
+
+      const { keywords, excludes = [], strategy } = cfg;
+
+      // Check excludes — skip this line if any exclude word present
+      if (excludes.some(ex => line.includes(ex))) continue;
+
+      let matched = false;
+
+      if (strategy === 'cash') {
+        // First token must exactly equal the keyword
+        const firstTok = line.split(/\s+/)[0];
+        matched = firstTok === keywords[0];
+      } else {
+        // 'last' / 'window': any keyword must appear in the line
+        matched = keywords.some(kw => line.includes(kw));
+      }
+
+      if (matched) {
+        const amt = ocr_bestAmount(line);
+        if (amt !== null && amt >= 1) {
+          results[fieldId] = amt;
+          console.log(`[parseAllFields] ${fieldId} ← ${amt}  (line: "${line}")`);
         }
       }
     }
-
-    // ── Zomato: contains "zomato", NOT "online" ──────────────────
-    if (zomato === null) {
-      // Handle OCR noise like "zZomato" → normalisation already lower-cased
-      if (line.includes('zomato') && !line.includes('online')) {
-        const decimals = extractDecimals(line);
-        if (decimals.length > 0) {
-          zomato = decimals[decimals.length - 1]; // last decimal = Amount
-        }
-      }
-    }
-
-    if (cash !== null && zomato !== null) break; // found both, stop early
   }
 
-  console.log('[LineParse] Result →', { cash, zomato });
-  return { cash, zomato };
+  return results;
 }
 
-/** Legacy shim kept so existing SCAN_KEYWORD_MAP / SCAN_FIELD_OPTIONS still compile
- *  but Cash & Zomato are now handled exclusively by parseCashAndZomato().
+// ── 4. CLAUDE VISION (primary method) ────────────────────────
+/**
+ * readWithClaudeVision(file)
+ * Sends the image to Claude claude-sonnet-4-20250514 with a tight prompt.
+ * Returns parsed { fieldId: amount } object.
  */
-function extractValueAfterKeyword(text, keyword, windowSize = 50, firstOnly = false, wholeWord = false) {
-  const lowerText = text.toLowerCase();
-  const lowerKw   = keyword.toLowerCase();
-  let searchFrom  = 0;
-  let best        = null;
+async function readWithClaudeVision(file, loaderTxt) {
+  if (loaderTxt) loaderTxt.textContent = 'Reading with Claude Vision…';
 
-  while (true) {
-    const idx = lowerText.indexOf(lowerKw, searchFrom);
-    if (idx === -1) break;
-    if (wholeWord) {
-      const before = idx > 0 ? lowerText[idx - 1] : ' ';
-      const after  = lowerText[idx + lowerKw.length] || ' ';
-      if (/[a-z]/.test(before) || /[a-z]/.test(after)) { searchFrom = idx + lowerKw.length; continue; }
-    }
-    const segment = text.slice(idx + keyword.length, idx + keyword.length + windowSize);
-    const numMatches = segment.match(/[₹Rs.\s]*[\d,]+(\.\d+)?/g);
-    if (numMatches) {
-      for (const m of numMatches) {
-        const cleaned = parseFloat(m.replace(/[₹Rs,\s]/g, ''));
-        if (!isNaN(cleaned)) {
-          if (firstOnly) { best = cleaned; break; }
-          if (best === null || cleaned > best) best = cleaned;
-        }
-      }
-    }
-    searchFrom = idx + lowerKw.length;
-  }
-  return best;
+  // Convert file to base64
+  const base64 = await new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(',')[1]);
+    r.onerror = () => rej(new Error('FileReader failed'));
+    r.readAsDataURL(file);
+  });
+
+  const mediaType = file.type || 'image/jpeg';
+
+  const prompt = `This is a POS Sales Report image. Extract payment amounts ONLY.
+
+Return ONLY a valid JSON object with these exact keys (use null if not found):
+{
+  "cash": <number or null>,
+  "zomato": <number or null>,
+  "upi": <number or null>,
+  "card": <number or null>,
+  "dineout": <number or null>,
+  "razorpay": <number or null>
 }
 
-/** Main OCR entry point */
-async function scanReport() {
-  const fileInput = document.getElementById('scan-file-input');
-  const btn       = document.getElementById('scan-btn');
-  const loader    = document.getElementById('scan-loader');
-  const loaderTxt = document.getElementById('scan-loader-text');
-  const resultMsg = document.getElementById('scan-result-msg');
+Rules:
+- For Cash: find the row starting with "Cash" (NOT Credit Card). Use the Amount column (last/rightmost number).
+- For Zomato: find the "Zomato Pay" row (ignore any "Zomato Online" row). Use the Amount column.
+- For UPI: look for Paytm, UPI, Paytm-Offline rows.
+- For Card: look for Credit Card row.
+- For Dineout: look for Dine Out / Dineout row.
+- For Razorpay: look for Razorpay row.
+- The Amount column is always the LAST number on each row (not the Bills/count column which is first).
+- Return only the JSON object, no explanation, no markdown.`;
 
-  if (!fileInput.files || !fileInput.files[0]) {
-    resultMsg.style.color = '#c0392b';
-    resultMsg.textContent = '⚠️ Please select an image or PDF file first.';
-    return;
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+          { type: 'text', text: prompt }
+        ]
+      }]
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Claude API ${response.status}: ${err}`);
   }
 
-  const file = fileInput.files[0];
+  const data = await response.json();
+  const raw = (data.content || []).map(b => b.text || '').join('').trim();
+  console.log('[ClaudeVision] Raw response:', raw);
 
-  // Show loader
-  btn.disabled = true;
-  loader.classList.add('active');
-  resultMsg.textContent = '';
-  loaderTxt.textContent = 'Reading file…';
+  // Strip markdown fences if present
+  const clean = raw.replace(/```json|```/gi, '').trim();
+  const parsed = JSON.parse(clean);
 
-  try {
-    let ocrText = '';
-
-    if (file.type === 'application/pdf') {
-      // ── PDF path: render first page via pdf.js if available, else fallback ──
-      loaderTxt.textContent = 'Extracting PDF page…';
-      // We'll pass the file directly to Tesseract (it handles image-based PDFs)
-      // For text-based PDFs, use FileReader to extract text via pdfjs if loaded,
-      // otherwise fall back to Tesseract on the raw file.
-      ocrText = await ocrWithTesseract(file, loaderTxt);
-    } else {
-      // ── Image path ──
-      loaderTxt.textContent = 'Running OCR…';
-      ocrText = await ocrWithTesseract(file, loaderTxt);
-    }
-
-    console.log('[ScanReport] Raw OCR text:\n', ocrText);
-
-    loaderTxt.textContent = 'Auto-filling fields…';
-    const filled = autoFillReport(ocrText);
-
-    loader.classList.remove('active');
-    btn.disabled = false;
-
-    if (filled.length === 0) {
-      resultMsg.style.color = '#e67e22';
-      resultMsg.textContent = '⚠️ No matching payment values found. Check console for OCR output.';
-    } else {
-      resultMsg.style.color = '#27ae60';
-      resultMsg.textContent = `✅ Filled: ${filled.join(', ')}`;
-
-      // Show parsed Cash & Zomato JSON in UI panel
-      const { cash, zomato } = parseCashAndZomato(ocrText);
-      const jsonPanel = document.getElementById('scan-parsed-json');
-      if (jsonPanel) {
-        jsonPanel.style.display = 'block';
-        jsonPanel.textContent = '📊 Line-Parse Result:\n' + JSON.stringify({ cash, zomato }, null, 2);
-      }
-    }
-  } catch (err) {
-    loader.classList.remove('active');
-    btn.disabled = false;
-    resultMsg.style.color = '#c0392b';
-    resultMsg.textContent = '❌ Scan failed: ' + err.message;
-    console.error('[ScanReport] Error:', err);
-  }
+  // Map to fieldId keys
+  return {
+    'rep-Cash':     parsed.cash     ?? null,
+    'rep-Zomato':   parsed.zomato   ?? null,
+    'rep-UPI':      parsed.upi      ?? null,
+    'rep-Card':     parsed.card     ?? null,
+    'rep-Dineout':  parsed.dineout  ?? null,
+    'rep-Razorpay': parsed.razorpay ?? null,
+  };
 }
 
-/** Run Tesseract OCR on a File object, returns plain text */
+// ── 5. TESSERACT FALLBACK ─────────────────────────────────────
 async function ocrWithTesseract(file, loaderTxt) {
+  if (loaderTxt) loaderTxt.textContent = 'Running Tesseract OCR (fallback)…';
   const url = URL.createObjectURL(file);
   try {
     const worker = await Tesseract.createWorker('eng', 1, {
       logger: m => {
         if (m.status === 'recognizing text' && loaderTxt) {
-          const pct = Math.round((m.progress || 0) * 100);
-          loaderTxt.textContent = `OCR progress: ${pct}%`;
+          loaderTxt.textContent = `OCR: ${Math.round((m.progress||0)*100)}%`;
         }
       }
     });
@@ -722,78 +709,120 @@ async function ocrWithTesseract(file, loaderTxt) {
   }
 }
 
-/**
- * Per-field extraction options:
- *   firstOnly  → take first number found (not largest) — for Zomato Pay (amount is right after keyword)
- *   wholeWord  → keyword must be a standalone word — for Cash (avoids matching inside "Credit Card")
- */
-const SCAN_FIELD_OPTIONS = {
-  'rep-UPI':      { firstOnly: false, wholeWord: false },
-  'rep-Card':     { firstOnly: false, wholeWord: false },
-  'rep-Dineout':  { firstOnly: false, wholeWord: false },
-  'rep-Zomato':   { firstOnly: true,  wholeWord: false },
-  'rep-Razorpay': { firstOnly: false, wholeWord: false },
-  'rep-Cash':     { firstOnly: false, wholeWord: true  }
-};
-
-/**
- * autoFillReport(text)
- * – Cash & Zomato → handled by line-based parseCashAndZomato()
- * – All other fields → existing keyword-window extractor
- * – Skips fields where no value is found (never inserts 0)
- * – Calls updateDifferences() after filling
- * Returns array of field labels that were filled.
- */
-function autoFillReport(text) {
+// ── 6. FILL FIELDS FROM RESULT MAP ───────────────────────────
+function fillFields(resultMap) {
   const filled = [];
-
-  // ── Step 1: line-based extraction for Cash & Zomato ─────────────
-  const { cash, zomato } = parseCashAndZomato(text);
-
-  function setField(fieldId, value) {
-    if (value !== null && value !== undefined) {
+  for (const [fieldId, value] of Object.entries(resultMap)) {
+    if (value !== null && value !== undefined && !isNaN(value)) {
       const el = document.getElementById(fieldId);
       if (el) {
         el.value = Math.round(value);
-        const label = fieldId.replace('rep-', '');
-        filled.push(label);
-        console.log(`[autoFillReport] ${fieldId} ← ${Math.round(value)}`);
+        filled.push(fieldId.replace('rep-', ''));
+        console.log(`[fillFields] ${fieldId} ← ${Math.round(value)}`);
       }
     }
   }
-
-  setField('rep-Cash',   cash);
-  setField('rep-Zomato', zomato);
-
-  // ── Step 2: window-based extraction for remaining fields ─────────
-  const SKIP_LINE_PARSED = new Set(['rep-Cash', 'rep-Zomato']);
-
-  Object.entries(SCAN_KEYWORD_MAP).forEach(([fieldId, keywords]) => {
-    if (SKIP_LINE_PARSED.has(fieldId)) return;   // already handled above
-
-    const opts = SCAN_FIELD_OPTIONS[fieldId] || {};
-    let best = null;
-
-    for (const kw of keywords) {
-      const val = extractValueAfterKeyword(text, kw, 50, opts.firstOnly, opts.wholeWord);
-      if (val !== null && (best === null || (!opts.firstOnly && val > best))) {
-        best = val;
-        if (opts.firstOnly) break;
-      }
-    }
-
-    setField(fieldId, best);
-  });
-
   if (typeof updateDifferences === 'function') updateDifferences();
-
-  // Log the final parsed JSON for Cash & Zomato
-  console.log('[autoFillReport] Line-parse result →', JSON.stringify({ cash, zomato }));
-
   return filled;
 }
+
+// ── 7. MAIN SCAN ENTRY POINT ──────────────────────────────────
+async function scanReport() {
+  const fileInput = document.getElementById('scan-file-input');
+  const btn       = document.getElementById('scan-btn');
+  const loader    = document.getElementById('scan-loader');
+  const loaderTxt = document.getElementById('scan-loader-text');
+  const resultMsg = document.getElementById('scan-result-msg');
+  const jsonPanel = document.getElementById('scan-parsed-json');
+
+  if (!fileInput.files || !fileInput.files[0]) {
+    resultMsg.style.color = '#c0392b';
+    resultMsg.textContent = '⚠️ Please select an image or PDF file first.';
+    return;
+  }
+
+  const file = fileInput.files[0];
+  btn.disabled = true;
+  loader.classList.add('active');
+  resultMsg.textContent = '';
+  if (jsonPanel) { jsonPanel.style.display = 'none'; jsonPanel.textContent = ''; }
+  loaderTxt.textContent = 'Starting…';
+
+  let resultMap = {};
+  let method = '';
+
+  try {
+    // ── Primary: Claude Vision (images only; skip PDF for now) ──
+    if (!file.type.includes('pdf')) {
+      try {
+        resultMap = await readWithClaudeVision(file, loaderTxt);
+        method = 'Claude Vision';
+      } catch (visionErr) {
+        console.warn('[scanReport] Claude Vision failed, falling back to Tesseract:', visionErr.message);
+        loaderTxt.textContent = 'Vision failed, trying OCR…';
+        const ocrText = await ocrWithTesseract(file, loaderTxt);
+        console.log('[Tesseract] Raw text:\n', ocrText);
+        resultMap = parseAllFields(ocrText);
+        method = 'Tesseract OCR';
+      }
+    } else {
+      // PDF → Tesseract
+      const ocrText = await ocrWithTesseract(file, loaderTxt);
+      console.log('[Tesseract] Raw text:\n', ocrText);
+      resultMap = parseAllFields(ocrText);
+      method = 'Tesseract OCR (PDF)';
+    }
+
+    loaderTxt.textContent = 'Filling fields…';
+    const filled = fillFields(resultMap);
+
+    loader.classList.remove('active');
+    btn.disabled = false;
+
+    // Build a clean display map (only non-null)
+    const displayMap = {};
+    for (const [k, v] of Object.entries(resultMap)) {
+      if (v !== null) displayMap[k.replace('rep-', '')] = Math.round(v);
+    }
+
+    if (filled.length === 0) {
+      resultMsg.style.color = '#e67e22';
+      resultMsg.textContent = '⚠️ No values found. Try a clearer image.';
+    } else {
+      resultMsg.style.color = '#27ae60';
+      resultMsg.textContent = `✅ Filled via ${method}: ${filled.join(', ')}`;
+    }
+
+    if (jsonPanel) {
+      jsonPanel.style.display = 'block';
+      jsonPanel.textContent =
+        `Method: ${method}\n\n` +
+        `Parsed amounts:\n${JSON.stringify(displayMap, null, 2)}\n\n` +
+        `Cash & Zomato:\n${JSON.stringify({ cash: displayMap.Cash ?? null, zomato: displayMap.Zomato ?? null }, null, 2)}`;
+    }
+
+  } catch (err) {
+    loader.classList.remove('active');
+    btn.disabled = false;
+    resultMsg.style.color = '#c0392b';
+    resultMsg.textContent = '❌ Scan failed: ' + err.message;
+    if (jsonPanel) { jsonPanel.style.display = 'block'; jsonPanel.textContent = 'Error: ' + err.message; }
+    console.error('[scanReport] Error:', err);
+  }
+}
+
+// ── 8. LEGACY SHIMS (kept so nothing else breaks) ────────────
+function autoFillReport(text) { return fillFields(parseAllFields(text)); }
+function extractValueAfterKeyword() { return null; }
+function parseCashAndZomato(text) {
+  const r = parseAllFields(text);
+  return { cash: r['rep-Cash'], zomato: r['rep-Zomato'] };
+}
+const SCAN_KEYWORD_MAP   = {};
+const SCAN_FIELD_OPTIONS = {};
+
 // ══════════════════════════════════════════════════════════════
-// END SCAN FEATURE
+// END SCAN FEATURE  v3
 // ══════════════════════════════════════════════════════════════
 
   </script>
