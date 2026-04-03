@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sales Breakdown Tool</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 1rem; background: #f7f7f7; }
+    section { margin-bottom: 2rem; background: #fff; padding: 1rem; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    th { background: #f0f0f0; }
+    .short { color: red; }
+    .extra { color: green; }
+    .locked input, .locked button { background: #eee; pointer-events: none; }
+    .pos-receipt { font-family: monospace; font-size: 12px; white-space: pre; }
+    .flex-table { display: flex; gap: 2rem; flex-wrap: wrap; }
+    .column { width: 501px; height: 395px; overflow: auto; box-sizing: border-box; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fff; }
+    .diff-table { width: auto; margin-top: 1rem; }
+    .breakdown-line { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
+    .autolock-control { display: inline-flex; align-items: center; gap: 0.5rem; }
+    .cash-flex { display: flex; gap: 2rem; flex-wrap: wrap; }
+    .cash-col { width: 501px; height: 395px; overflow: auto; box-sizing: border-box; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fff; }
+    #denomination-totals { font-size: 0.95em; line-height: 1.4; white-space: pre-line; font-family: monospace; margin-top: 1rem; }
+  </style>
+  <!-- Tesseract.js for OCR -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    /* ── Scan feature styles (non-invasive) ── */
+    #scan-section {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border: 1.5px dashed #7c9fd4;
+      border-radius: 8px;
+      background: #f0f5ff;
+    }
+    #scan-section h4 { margin: 0 0 8px; font-size: 0.95em; color: #2d5fa6; }
+    #scan-file-input { font-size: 0.85em; }
+    #scan-btn {
+      margin-top: 6px;
+      padding: 6px 14px;
+      background: #2d5fa6;
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.9em;
+    }
+    #scan-btn:disabled { background: #8fadd4; cursor: default; }
+    #scan-loader {
+      display: none;
+      margin-top: 6px;
+      font-size: 0.85em;
+      color: #2d5fa6;
+      align-items: center;
+      gap: 8px;
+    }
+    #scan-loader.active { display: flex; }
+    #scan-result-msg {
+      margin-top: 6px;
+      font-size: 0.83em;
+      min-height: 16px;
+    }
+    .scan-spinner {
+      width: 16px; height: 16px;
+      border: 2px solid #cde;
+      border-top-color: #2d5fa6;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Sales Breakdown Tool</h1>
+<p id="autosave-status" style="color: green; font-size: 0.9em;"></p>
+  <p>🕒 Auto-lock in: <span id="lock-timer">3000</span>s <span class="autolock-control">| Set: <input id="lock-time-set" type="number" value="3000" min="10" style="width: 50px">s</span></p>
+
+  <section>
+    <label>Date: <input type="date" id="date"></label>
+    <button onclick="setDateOffset(0)">Today</button>
+    <button onclick="setDateOffset(-1)">Yesterday</button>
+  </section>
+
+  <section>
+    <h2>Cash Count</h2>
+    <div class="cash-flex">
+      <div class="cash-col" id="cash-count"></div>
+      <div class="cash-col"><pre id="denomination-totals"></pre></div>
+    </div>
+    <p>Total Cash: ₹<span id="total-cash">0</span></p>
+    <label>Stock Cash: ₹<input type="number" id="stock-cash" value="0" oninput="updateCashTotal()"></label><br>
+    <label>Petty Cash: ₹<input type="number" id="petty-cash" value="0" oninput="updateCashTotal()"></label><br>
+    <p><strong>Final Cash for Received:</strong> ₹<span id="final-cash">0</span></p>
+  </section>
+
+  <section class="flex-table">
+    <div class="column">
+      <h2>Received</h2>
+      <div id="received"></div>
+    </div>
+    <div class="column">
+      <h2>Report</h2>
+      <div id="report"></div>
+
+      <!-- ── SCAN & AUTO-FILL FEATURE (non-invasive addition) ── -->
+      <div id="scan-section">
+        <h4>📷 Scan / Upload Report</h4>
+        <input type="file" id="scan-file-input" accept="image/*,application/pdf">
+        <br>
+        <button id="scan-btn" onclick="scanReport()">🔍 Scan &amp; Auto-Fill</button>
+        <div id="scan-loader"><div class="scan-spinner"></div><span id="scan-loader-text">Scanning…</span></div>
+        <div id="scan-result-msg"></div>
+      </div>
+
+<pre id="envelope-breakdown" style="font-family: monospace; margin-top: 10px; border: 1px dashed #aaa; padding: 8px; background: #fdfdfd;"></pre>
+<button onclick="printEnvelopeBreakdown()" style="margin-top: 5px;">🧾 Print Envelope Breakdown</button>
+
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Difference & Settlement</h2>
+    <table class="diff-table">
+      <thead>
+        <tr><th>Payment Type</th><th>Difference</th><th>Suggestion</th></tr>
+      </thead>
+      <tbody id="differences"></tbody>
+    </table>
+    <p id="cash-status"></p>
+  </section>
+
+  <section>
+    <button onclick="matchData()">✅ Match</button>
+    <button onclick="unlockEdit()">🔓 Unlock</button>
+    <button onclick="saveData()">💾 Save</button>
+    <button onclick="clearAll()">🧹 Clear All</button>
+    <button onclick="downloadPDF()">📥 Download PDF</button>
+    <button onclick="printPOS()">🧾 POS Print</button>
+    <button onclick="exportCSV()">📊 Export CSV</button>
+  </section>
+
+  <section>
+    <h2>🔁 History</h2>
+    <table id="history-table"></table>
+  </section>
+
+  <script>
+    const denominations = [500, 200, 100, 50, 20, 10, 5, 2, 1];
+    const paymentTypes = ["UPI", "Card", "Dineout", "Zomato", "Razorpay", "Cash"];
+    let lockTimer = 3000;
+    let countdown;
+
+    document.getElementById('date').valueAsDate = new Date();
+    document.getElementById('date').addEventListener('change', loadData);
+    document.getElementById('lock-time-set').addEventListener('input', (e) => {
+      lockTimer = parseInt(e.target.value) || 3000;
+      resetAutoLock();
+    });
+
+    function setDateOffset(offset) {
+      const date = new Date();
+      date.setDate(date.getDate() + offset);
+      document.getElementById('date').valueAsDate = date;
+      loadData();
+    }
+
+    function buildInputs() {
+      let ccHTML = '', rHTML = '', rpHTML = '';
+      denominations.forEach(val => {
+        ccHTML += `<label>₹${val}: <input type="number" id="cc-${val}" value="0" oninput="updateCashTotal()" onkeydown="focusNext(event, this)"></label><br>`;
+
+
+      });
+      document.getElementById('cash-count').innerHTML = ccHTML;
+
+      paymentTypes.forEach((type, i) => {
+        rHTML += `<label>${type}: <input type="number" id="rec-${type}" value="0" oninput="updateDifferences()" onkeydown="focusNext(event, this)"></label><br>`;
+rpHTML += `<label>${type}: <input type="number" id="rep-${type}" value="0" oninput="updateDifferences(); if (type === 'Cash') autoSuggestEnvelopeBreakdown();" onkeydown="focusNext(event, this)"></label><br>`;
+
+
+      });
+      document.getElementById('received').innerHTML = rHTML;
+      document.getElementById('report').innerHTML = rpHTML;
+    }
+
+    function updateCashTotal() {
+      let total = 0;
+      let breakdown = [];
+      denominations.forEach(val => {
+        const count = +document.getElementById(`cc-${val}`).value || 0;
+        const amount = val * count;
+        total += amount;
+        breakdown.push(`${val}×${count}=${amount}`);
+      });
+      document.getElementById('total-cash').textContent = total;
+      document.getElementById('denomination-totals').textContent = breakdown.join("\n");
+
+      const stock = +document.getElementById('stock-cash').value || 0;
+      const petty = +document.getElementById('petty-cash').value || 0;
+      const final = total + stock - petty;
+      document.getElementById('final-cash').textContent = final;
+      document.getElementById('rec-Cash').value = final;
+
+      updateDifferences();
+autoSuggestEnvelopeBreakdown();
+
+
+    }
+function focusNext(event, input) {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    const inputs = Array.from(document.querySelectorAll('input[type="number"]'))
+      .filter(el => el.offsetParent !== null); // only visible
+    const index = inputs.indexOf(input);
+    if (index !== -1 && index + 1 < inputs.length) {
+      inputs[index + 1].focus();
+      inputs[index + 1].select();
+    }
+  }
+}
+
+
+    function updateDifferences() {
+      const tbody = document.getElementById('differences');
+      tbody.innerHTML = '';
+      let cashDiff = 0;
+
+      paymentTypes.forEach(type => {
+        let rec = +document.getElementById(`rec-${type}`).value || 0;
+        let rep = +document.getElementById(`rep-${type}`).value || 0;
+        let diff = rec - rep;
+        let className = diff < 0 ? 'short' : diff > 0 ? 'extra' : '';
+        let suggestion = diff < 0 ? `Move ₹${-diff} from ${type} to Cash` : diff > 0 ? `Move ₹${diff} from Cash to ${type}` : '✔ Balanced';
+        if (type === 'Cash') cashDiff = diff;
+        tbody.innerHTML += `<tr><td>${type}</td><td class="${className}">${diff}</td><td>${suggestion}</td></tr>`;
+      });
+
+      document.getElementById('cash-status').textContent =
+        cashDiff < 0 ? `⚠️ Cash Short by ₹${-cashDiff}` :
+        cashDiff > 0 ? `⚠️ Extra Cash ₹${cashDiff}` : '✅ Cash Balanced';
+    }
+
+    function autoTab(el, evt) {
+      if (evt.inputType !== 'insertText') return;
+      const inputs = Array.from(document.querySelectorAll('#received input'));
+      const index = inputs.indexOf(el);
+      if (index > -1 && index < inputs.length - 1) inputs[index + 1].focus();
+    }
+
+    function getData() {
+      const data = { cash: {}, received: {}, report: {}, stock: 0, petty: 0 };
+      denominations.forEach(val => data.cash[val] = +document.getElementById(`cc-${val}`).value || 0);
+      paymentTypes.forEach(type => {
+        data.received[type] = +document.getElementById(`rec-${type}`).value || 0;
+        data.report[type] = +document.getElementById(`rep-${type}`).value || 0;
+      });
+      data.stock = +document.getElementById('stock-cash').value || 0;
+      data.petty = +document.getElementById('petty-cash').value || 0;
+      return data;
+    }
+
+    function saveData() {
+      const date = document.getElementById('date').value;
+      localStorage.setItem(`sales-${date}`, JSON.stringify(getData()));
+      document.body.classList.add('locked');
+      loadHistory();
+    }
+
+    function unlockEdit() {
+      const pass = prompt("Enter passcode:");
+      if (pass === "9016") {
+        document.body.classList.remove('locked');
+      } else {
+        alert("Wrong passcode");
+      }
+    }
+
+    function loadData() {
+      const date = document.getElementById('date').value;
+      const data = JSON.parse(localStorage.getItem(`sales-${date}`)) || {};
+      denominations.forEach(val => document.getElementById(`cc-${val}`).value = data.cash?.[val] || 0);
+      paymentTypes.forEach(type => {
+        document.getElementById(`rec-${type}`).value = data.received?.[type] || 0;
+        document.getElementById(`rep-${type}`).value = data.report?.[type] || 0;
+      });
+      document.getElementById('stock-cash').value = data.stock || 0;
+      document.getElementById('petty-cash').value = data.petty !== undefined ? data.petty : 5000;
+
+
+      updateCashTotal();
+autoSuggestEnvelopeBreakdown();
+
+    }
+
+    function matchData() {
+      if (!confirm("Are you sure to Match all Received to Report?")) return;
+      paymentTypes.forEach(type => {
+        if (type !== 'Cash') document.getElementById(`rep-${type}`).value = document.getElementById(`rec-${type}`).value;
+      });
+      updateDifferences();
+    }
+
+    function clearAll() {
+      if (!confirm("Clear everything for the current date?")) return;
+      denominations.forEach(val => document.getElementById(`cc-${val}`).value = 0);
+      paymentTypes.forEach(type => {
+        document.getElementById(`rec-${type}`).value = 0;
+        document.getElementById(`rep-${type}`).value = 0;
+      });
+      document.getElementById('stock-cash').value = 0;
+      document.getElementById('petty-cash').value = 0;
+      updateCashTotal();
+    }
+
+    function downloadPDF() {
+      const date = document.getElementById('date').value;
+      const printWindow = window.open('', '_blank');
+      printWindow.document.write('<html><head><title>Sales_' + date + '</title></head><body>' + document.body.innerHTML + '</body></html>');
+      printWindow.document.close();
+      printWindow.print();
+    }
+
+    function printPOS() {
+  const date = document.getElementById('date').value;
+  const petty = +document.getElementById('petty-cash').value || 0;
+  const stock = +document.getElementById('stock-cash').value || 0;
+  const cashInCounter = petty - stock;
+  const envelopeCash = +document.getElementById('rep-Cash').value || 0;
+  const cashStatus = document.getElementById('cash-status').textContent;
+
+  let receipt = "NINIS VADODARA SALES SUMMARY\n";
+  receipt += `DATE: ${date}\n`;
+  receipt += "--------------------------\n\n";
+  receipt += "RECEIVED AMOUNT\n";
+
+  const types = ["UPI", "Card", "Dineout", "Zomato", "Razorpay", "Cash"];
+  types.forEach(type => {
+    const val = +document.getElementById(`rec-${type}`).value || 0;
+    receipt += `${type.padEnd(10)}: ₹${val}\n`;
+  });
+
+  receipt += "--------------------------\n";
+  receipt += `TOTAL PETTY CASH : ₹${petty}\n`;
+  receipt += `STOCK CASH       : ₹${stock}\n`;
+  receipt += `CASH IN COUNTER  : ₹${cashInCounter}\n`;
+  receipt += "--------------------------\n";
+  receipt += `ENVELOPE CASH    : ₹${envelopeCash}\n`;
+  receipt += "--------------------------\n";
+  if (cashStatus.includes('Extra Cash') || cashStatus.includes('Cash Short')) {
+    receipt += `${cashStatus.toUpperCase()}\n`;
+  }
+  receipt += "--------------------------";
+
+  const w = window.open('', '', 'width=250,height=600');
+  w.document.write(`<pre class='pos-receipt'>${receipt}</pre>`);
+  w.print();
+}
+
+
+    function exportCSV() {
+      const date = document.getElementById('date').value;
+      const data = getData();
+      let csv = `Date,Type,Amount\n`;
+      paymentTypes.forEach(type => {
+        csv += `${date},Received-${type},${data.received[type]}\n`;
+        csv += `${date},Report-${type},${data.report[type]}\n`;
+      });
+      denominations.forEach(val => {
+        csv += `${date},Cash-${val},${data.cash[val]}\n`;
+      });
+      csv += `${date},Stock,${data.stock}\n`;
+      csv += `${date},Petty,${data.petty}\n`;
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `Sales_${date}.csv`;
+      link.click();
+    }
+
+    function loadHistory() {
+      const table = document.getElementById('history-table');
+      table.innerHTML = '<tr><th>Date</th><th>Actions</th></tr>';
+      Object.keys(localStorage).filter(k => k.startsWith('sales-')).sort().forEach(key => {
+        const date = key.replace('sales-', '');
+        table.innerHTML += `<tr><td>${date}</td><td><button onclick="document.getElementById('date').value='${date}'; loadData();">View</button> <button onclick="deleteData('${date}')">Delete</button></td></tr>`;
+      });
+    }
+
+    function deleteData(date) {
+      const pass = prompt("Enter passcode to delete:");
+      if (pass === "9016") {
+        localStorage.removeItem(`sales-${date}`);
+        loadHistory();
+      } else {
+        alert("Wrong passcode");
+      }
+    }
+
+    function resetAutoLock() {
+      clearInterval(countdown);
+      let timer = lockTimer;
+      document.getElementById('lock-timer').textContent = timer;
+      countdown = setInterval(() => {
+        timer--;
+        document.getElementById('lock-timer').textContent = timer;
+        if (timer <= 0) {
+          document.body.classList.add('locked');
+          clearInterval(countdown);
+        }
+      }, 1000);
+    }
+
+    buildInputs();
+    loadData();
+    loadHistory();
+    resetAutoLock();
+    document.body.addEventListener('input', resetAutoLock);
+document.body.addEventListener('input', (e) => {
+  if (e.target.id === 'rep-Cash') {
+    autoSuggestEnvelopeBreakdown();
+  }
+});
+
+
+    document.body.addEventListener('click', resetAutoLock);
+document.body.addEventListener('input', autoSaveNow);
+
+
+// 🔁 Auto-save every 60 seconds (without locking)
+setInterval(() => {
+  const date = document.getElementById('date').value;
+  localStorage.setItem(`sales-${date}`, JSON.stringify(getData()));
+
+  // Show "Auto-saved" message
+  const status = document.getElementById('autosave-status');
+  if (status) {
+    const time = new Date().toLocaleTimeString();
+    status.textContent = `✅ Auto-saved at ${time}`;
+    setTimeout(() => status.textContent = '', 3000); // clear after 3s
+  }
+}, 60000); // 60 seconds
+
+function autoSaveNow() {
+  const date = document.getElementById('date').value;
+  localStorage.setItem(`sales-${date}`, JSON.stringify(getData()));
+
+  // Optional: Show a quick message
+  const status = document.getElementById('autosave-status');
+  if (status) {
+    const time = new Date().toLocaleTimeString();
+    status.textContent = `✅ Auto-saved at ${time}`;
+    clearTimeout(status._clearTimeout);
+    status._clearTimeout = setTimeout(() => status.textContent = '', 3000);
+  }
+}
+
+function autoSuggestEnvelopeBreakdown() {
+  const envelopeTarget = +document.getElementById('rep-Cash').value || 0;
+  let remaining = envelopeTarget;
+  const usedNotes = [];
+  const available = {};
+
+  // Read available cash from Cash Count
+  denominations.forEach(denom => {
+    const count = +document.getElementById(`cc-${denom}`).value || 0;
+    if (count > 0) {
+      available[denom] = count;
+    }
+  });
+const sortedDenoms = Object.keys(available).map(Number).sort((a, b) => b - a);
+
+sortedDenoms.forEach(denom => {
+  const maxNeeded = Math.floor(remaining / denom);
+  const canUse = Math.min(maxNeeded, available[denom]);
+  if (canUse > 0) {
+    usedNotes.push(`${denom} × ${canUse} = ₹${denom * canUse}`);
+    remaining -= denom * canUse;
+  }
+});
+
+const output = [`Envelope Cash Target: ₹${envelopeTarget}`];
+output.push(...usedNotes);
+output.push(
+  remaining > 0
+    ? `⚠️ Still need ₹${remaining} (not enough notes available)`
+    : `✅ Fully matched with available notes.`
+);
+
+document.getElementById('envelope-breakdown').textContent = output.join('\n');
+}
+
+function printEnvelopeBreakdown() {
+  const content = document.getElementById('envelope-breakdown').textContent;
+  const win = window.open('', '', 'width=400,height=600');
+  win.document.write(`<pre style="font-family: monospace;">${content}</pre>`);
+  win.document.close();
+  win.print();
+}
+
+
+
+
+
+
+// ══════════════════════════════════════════════════════════════
+// SCAN & AUTO-FILL FEATURE  (non-invasive — reads existing IDs)
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Keyword map: field-id → array of keywords to search (case-insensitive)
+ * Multiple keywords per field → ANY match triggers extraction
+ */
+const SCAN_KEYWORD_MAP = {
+  'rep-UPI':      ['paytm - offline', 'paytm offline', 'paytm-offline', 'paytm'],
+  'rep-Card':     ['credit card', 'creditcard'],
+  'rep-Dineout':  ['dine out', 'dineout'],
+  'rep-Zomato':   ['zomato pay'],
+  'rep-Razorpay': ['razorpay'],
+  'rep-Cash':     ['cash']
+};
+
+/**
+ * extractValueFromLine(text, keyword, opts)
+ * 1. Scopes to "Collection Breakup" section only (avoids Credit Card Breakup section)
+ * 2. Finds line containing keyword (with wholeWord / online-skip guards)
+ * 3. From that line picks the largest number >= 100 (skips bill counts like 7.00, 1.00)
+ */
+function extractValueFromLine(text, keyword, opts = {}) {
+  const lowerKw = keyword.toLowerCase();
+
+  // Scope to Collection Breakup section to avoid false matches in later sections
+  let searchText = text;
+  const sectionIdx = text.search(/collection breakup/i);
+  if (sectionIdx !== -1) {
+    const after = text.slice(sectionIdx);
+    const nextSection = after.search(/\n(?:credit card breakup|settlement|tax breakup|total bills)/i);
+    searchText = nextSection !== -1 ? after.slice(0, nextSection) : after;
+  }
+
+  const lines = searchText.split('\n');
+  let best = null;
+
+  for (const line of lines) {
+    const lowerLine = line.toLowerCase();
+    const kwIdx = lowerLine.indexOf(lowerKw);
+    if (kwIdx === -1) continue;
+
+    // wholeWord guard — char before/after keyword must not be a letter
+    if (opts.wholeWord) {
+      const before = kwIdx > 0 ? lowerLine[kwIdx - 1] : ' ';
+      const after  = lowerLine[kwIdx + lowerKw.length] || ' ';
+      if (/[a-z]/.test(before) || /[a-z]/.test(after)) continue;
+    }
+
+    // Zomato Pay — skip lines that contain 'online'
+    if (lowerKw === 'zomato pay' && lowerLine.includes('online')) continue;
+
+    // Extract all numbers from line
+    const allNums = [...line.matchAll(/[\d,]+(?:\.\d+)?/g)]
+      .map(m => parseFloat(m[0].replace(/,/g, '')))
+      .filter(n => !isNaN(n) && n > 0);
+
+    if (allNums.length === 0) continue;
+
+    // Prefer numbers >= 100 (amount column); fall back to largest if none qualify
+    const candidates = allNums.filter(n => n >= 100);
+    const picked = candidates.length > 0 ? Math.max(...candidates) : Math.max(...allNums);
+
+    if (best === null || picked > best) best = picked;
+  }
+
+  return best;
+}
+
+/** Main OCR entry point */
+async function scanReport() {
+  const fileInput = document.getElementById('scan-file-input');
+  const btn       = document.getElementById('scan-btn');
+  const loader    = document.getElementById('scan-loader');
+  const loaderTxt = document.getElementById('scan-loader-text');
+  const resultMsg = document.getElementById('scan-result-msg');
+
+  if (!fileInput.files || !fileInput.files[0]) {
+    resultMsg.style.color = '#c0392b';
+    resultMsg.textContent = '⚠️ Please select an image or PDF file first.';
+    return;
+  }
+
+  const file = fileInput.files[0];
+
+  // Show loader
+  btn.disabled = true;
+  loader.classList.add('active');
+  resultMsg.textContent = '';
+  loaderTxt.textContent = 'Reading file…';
+
+  try {
+    let ocrText = '';
+
+    if (file.type === 'application/pdf') {
+      // ── PDF path: render first page via pdf.js if available, else fallback ──
+      loaderTxt.textContent = 'Extracting PDF page…';
+      // We'll pass the file directly to Tesseract (it handles image-based PDFs)
+      // For text-based PDFs, use FileReader to extract text via pdfjs if loaded,
+      // otherwise fall back to Tesseract on the raw file.
+      ocrText = await ocrWithTesseract(file, loaderTxt);
+    } else {
+      // ── Image path ──
+      loaderTxt.textContent = 'Running OCR…';
+      ocrText = await ocrWithTesseract(file, loaderTxt);
+    }
+
+    console.log('[ScanReport] Raw OCR text:\n', ocrText);
+
+    loaderTxt.textContent = 'Auto-filling fields…';
+    const filled = autoFillReport(ocrText);
+
+    loader.classList.remove('active');
+    btn.disabled = false;
+
+    if (filled.length === 0) {
+      resultMsg.style.color = '#e67e22';
+      resultMsg.textContent = '⚠️ No matching payment values found. Check console for OCR output.';
+    } else {
+      resultMsg.style.color = '#27ae60';
+      resultMsg.textContent = `✅ Filled: ${filled.join(', ')}`;
+    }
+  } catch (err) {
+    loader.classList.remove('active');
+    btn.disabled = false;
+    resultMsg.style.color = '#c0392b';
+    resultMsg.textContent = '❌ Scan failed: ' + err.message;
+    console.error('[ScanReport] Error:', err);
+  }
+}
+
+/** Run Tesseract OCR on a File object, returns plain text */
+async function ocrWithTesseract(file, loaderTxt) {
+  const url = URL.createObjectURL(file);
+  try {
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (m.status === 'recognizing text' && loaderTxt) {
+          const pct = Math.round((m.progress || 0) * 100);
+          loaderTxt.textContent = `OCR progress: ${pct}%`;
+        }
+      }
+    });
+    const { data: { text } } = await worker.recognize(url);
+    await worker.terminate();
+    return text;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Per-field extraction options:
+ *   wholeWord → keyword must be standalone (Cash — avoids matching inside "Credit Card")
+ */
+const SCAN_FIELD_OPTIONS = {
+  'rep-UPI':      { wholeWord: false },
+  'rep-Card':     { wholeWord: false },
+  'rep-Dineout':  { wholeWord: false },
+  'rep-Zomato':   { wholeWord: false },
+  'rep-Razorpay': { wholeWord: false },
+  'rep-Cash':     { wholeWord: true  }
+};
+
+/**
+ * autoFillReport(text)
+ * – Finds the line matching each keyword, takes the last number on it (= Amount)
+ * – Skips fields where no value is found (never inserts 0)
+ * – Calls updateDifferences() after filling
+ */
+function autoFillReport(text) {
+  const filled = [];
+
+  // Clear all report fields first — old values must not persist if not found in this scan
+  Object.keys(SCAN_KEYWORD_MAP).forEach(fieldId => {
+    const el = document.getElementById(fieldId);
+    if (el) el.value = 0;
+  });
+
+  Object.entries(SCAN_KEYWORD_MAP).forEach(([fieldId, keywords]) => {
+    const opts = SCAN_FIELD_OPTIONS[fieldId] || {};
+    let best = null;
+
+    for (const kw of keywords) {
+      const val = extractValueFromLine(text, kw, opts);
+      if (val !== null && (best === null || val > best)) best = val;
+    }
+
+    if (best !== null) {
+      const el = document.getElementById(fieldId);
+      if (el) {
+        el.value = Math.round(best);
+        const label = fieldId.replace('rep-', '');
+        filled.push(label);
+        console.log(`[ScanReport] ${fieldId} ← ${Math.round(best)}`);
+      }
+    }
+  });
+
+  if (typeof updateDifferences === 'function') updateDifferences();
+  return filled;
+}
+// ══════════════════════════════════════════════════════════════
+// END SCAN FEATURE
+// ══════════════════════════════════════════════════════════════
+
+  </script>
+</body>
+</html>
+
+
+
+
